@@ -7,11 +7,64 @@
 #include <furi_hal.h>
 #include <lib/subghz/subghz_tx_rx_worker.h>
 #include "helpers/radio_device_loader.h"
+#include <storage/storage.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
 
 #define TAG "JammerApp"
 #define SUBGHZ_FREQUENCY_MIN 300000000
 #define SUBGHZ_FREQUENCY_MAX 928000000
 #define MESSAGE_MAX_LEN 1024
+#define DIR APP_DATA_PATH("jammer_app/")
+#define CFG_PATH APP_DATA_PATH("jammer_app/config.txt")
+
+static bool save_config(uint32_t freq, uint8_t mode) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(storage);
+    bool ok = false;
+
+    storage_common_mkdir(storage, APP_DATA_PATH("jammer_app"));
+
+    if(storage_file_open(f, CFG_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "%lu,%u\n", (unsigned long)freq, (unsigned)mode);
+        if(n > 0) {
+            size_t wrote = storage_file_write(f, buf, (size_t)n);
+            ok = (wrote == (size_t)n);
+        }
+        storage_file_close(f);
+    }
+
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    return ok;
+}
+
+static bool load_config(uint32_t* freq, uint8_t* mode) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(storage);
+    bool ok = false;
+
+    if(storage_file_open(f, CFG_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        char buf[64] = {0};
+        size_t n = storage_file_read(f, buf, sizeof(buf) - 1);
+        if(n > 0) {
+            unsigned long fval; unsigned int mval;
+            if(sscanf(buf, "%lu,%u", &fval, &mval) == 2) {
+                if(freq) *freq = (uint32_t)fval;
+                if(mode) *mode = (uint8_t)mval;
+                ok = true;
+            }
+        }
+        storage_file_close(f);
+    }
+
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    return ok;
+}
 
 static FuriHalRegion unlockedRegion = {
     .country_code = "FTW",
@@ -53,7 +106,6 @@ static const char* jamming_modes[] = {
     "Burst Mode"
 };
 
-static void jammer_show_splash_screen(JammerApp* app);
 static bool jammer_init_subghz(JammerApp* app);
 static void jammer_start_tx(JammerApp* app);
 static void jammer_switch_mode(JammerApp* app);
@@ -62,7 +114,6 @@ static void jammer_adjust_frequency(JammerApp* app, bool up);
 static uint32_t adjust_frequency_to_valid(uint32_t frequency, bool up);
 static bool is_frequency_valid(uint32_t frequency);
 static int32_t jammer_tx_thread(void* context);
-static void jammer_splash_screen_draw_callback(Canvas* canvas, void* context);
 static void jammer_draw_callback(Canvas* canvas, void* context);
 static void jammer_input_callback(InputEvent* input_event, void* context);
 
@@ -77,20 +128,19 @@ int32_t jammer_app(void* p) {
         return -1;
     }
 
-    jammer_show_splash_screen(app);
-
     if(!jammer_init_subghz(app)) {
         jammer_app_free(app);
         return -1;
     }
 
     jammer_start_tx(app);
+    jammer_update_view(app);
 
     FURI_LOG_I(TAG, "Entering main loop");
 
     InputEvent event;
     while(app->running) {
-        if(furi_message_queue_get(app->event_queue, &event, 10) == FuriStatusOk) {
+        if(furi_message_queue_get(app->event_queue, &event, 100) == FuriStatusOk) {
             if(event.type == InputTypeShort) {
                 switch(event.key) {
                     case InputKeyOk:
@@ -131,6 +181,7 @@ int32_t jammer_app(void* p) {
                 }
             }
         }
+        jammer_update_view(app);
     }
 
     FURI_LOG_I(TAG, "Exiting JammerApp main loop");
@@ -155,6 +206,7 @@ JammerApp* jammer_app_alloc(void) {
     app->running = true;
     app->tx_running = false;
     app->jamming_mode = JammerModeOok650Async;
+    load_config(&app->frequency, (uint8_t*)&app->jamming_mode);
     app->gui = furi_record_open(RECORD_GUI);
 
     furi_hal_region_set(&unlockedRegion);
@@ -311,62 +363,49 @@ static bool jammer_init_subghz(JammerApp* app) {
 #ifdef FURI_DEBUG
     FURI_LOG_D(TAG, "Enter jammer_init_subghz");
 #endif
-    app->device = radio_device_loader_set(NULL, SubGhzRadioDeviceTypeExternalCC1101);
+    
+    int retry_count = 0;
+    const int max_retries = 3;
+    
+    while(retry_count < max_retries) {
+        app->device = radio_device_loader_set(NULL, SubGhzRadioDeviceTypeExternalCC1101);
 
-    if(!app->device) {
-        FURI_LOG_W(TAG, "External CC1101 not found, trying internal CC1101.");
-        app->device = radio_device_loader_set(NULL, SubGhzRadioDeviceTypeInternal);
         if(!app->device) {
-            FURI_LOG_E(TAG, "Failed to initialize internal CC1101.");
-            return false;
+            FURI_LOG_W(TAG, "External CC1101 not found, trying internal CC1101.");
+            app->device = radio_device_loader_set(NULL, SubGhzRadioDeviceTypeInternal);
+            if(!app->device) {
+                FURI_LOG_E(TAG, "Failed to initialize CC1101, retry %d/%d", retry_count + 1, max_retries);
+                retry_count++;
+                furi_delay_ms(100);
+                continue;
+            }
+        }
+
+        subghz_devices_reset(app->device);
+        subghz_devices_idle(app->device);
+
+        FURI_LOG_I(TAG, "Initialized device %s", app->device->name);
+
+        subghz_devices_load_preset(app->device, FuriHalSubGhzPresetOok650Async, NULL);
+
+        if(subghz_tx_rx_worker_start(app->subghz_txrx, app->device, app->frequency)) {
+            FURI_LOG_I(TAG, "Started SubGhz TX RX worker with device %s", app->device->name);
+#ifdef FURI_DEBUG
+            FURI_LOG_D(TAG, "Exit jammer_init_subghz");
+#endif
+            return true;
+        } else {
+            FURI_LOG_E(TAG, "Failed to start TX RX worker with device %s", app->device->name);
+            subghz_tx_rx_worker_stop(app->subghz_txrx);
+            retry_count++;
+            furi_delay_ms(100);
         }
     }
-
-    subghz_devices_reset(app->device);
-    subghz_devices_idle(app->device);
-
-    FURI_LOG_I(TAG, "Initialized device %s", app->device->name);
-
-    subghz_devices_load_preset(app->device, FuriHalSubGhzPresetOok650Async, NULL);
-
-    if(subghz_tx_rx_worker_start(app->subghz_txrx, app->device, app->frequency)) {
-        FURI_LOG_I(TAG, "Started SubGhz TX RX worker with device %s", app->device->name);
+    
 #ifdef FURI_DEBUG
-        FURI_LOG_D(TAG, "Exit jammer_init_subghz");
+    FURI_LOG_D(TAG, "Exit jammer_init_subghz with failure");
 #endif
-        return true;
-    } else {
-        FURI_LOG_E(TAG, "Failed to start TX RX worker with device %s", app->device->name);
-        subghz_tx_rx_worker_stop(app->subghz_txrx);
-#ifdef FURI_DEBUG
-        FURI_LOG_D(TAG, "Exit jammer_init_subghz");
-#endif
-        return false;
-    }
-}
-
-static void jammer_show_splash_screen(JammerApp* app) {
-    view_port_draw_callback_set(app->view_port, jammer_splash_screen_draw_callback, app);
-    view_port_update(app->view_port);
-    furi_delay_ms(2000);
-    view_port_draw_callback_set(app->view_port, jammer_draw_callback, app);
-}
-
-static void jammer_splash_screen_draw_callback(Canvas* canvas, void* context) {
-    UNUSED(context);
-
-    canvas_clear(canvas);
-
-    for(int x = 0; x < 128; x += 8) {
-        for(int y = 0; y < 64; y += 8) {
-            canvas_draw_dot(canvas, x, y);
-        }
-    }
-
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, 64, 15, AlignCenter, AlignTop, "RF Jammer");
-    canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignTop, "by RocketGod");
-    canvas_draw_frame(canvas, 0, 0, 128, 64);
+    return false;
 }
 
 static void jammer_draw_callback(Canvas* canvas, void* context) {
@@ -399,6 +438,9 @@ static void jammer_draw_callback(Canvas* canvas, void* context) {
 
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignTop, jamming_modes[app->jamming_mode]);
+    
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 35, AlignCenter, AlignTop, app->tx_running ? "TX ON" : "TX OFF");
 }
 
 static void jammer_input_callback(InputEvent* input_event, void* context) {
@@ -438,6 +480,7 @@ static void jammer_adjust_frequency(JammerApp* app, bool up) {
     if(app->tx_running) {
         if(app->subghz_txrx && app->device) {
             subghz_tx_rx_worker_stop(app->subghz_txrx);
+            furi_delay_ms(50);
             if(subghz_tx_rx_worker_start(app->subghz_txrx, app->device, app->frequency)) {
                 FURI_LOG_I(TAG, "Restarted SubGhz TX RX worker with new frequency %lu Hz", app->frequency);
             } else {
@@ -447,6 +490,7 @@ static void jammer_adjust_frequency(JammerApp* app, bool up) {
             FURI_LOG_E(TAG, "Cannot adjust frequency, subghz_txrx or device is NULL");
         }
     }
+    save_config(app->frequency, (uint8_t)app->jamming_mode);
 #ifdef FURI_DEBUG
     FURI_LOG_D(TAG, "Exit jammer_adjust_frequency");
 #endif
@@ -486,6 +530,7 @@ static void jammer_switch_mode(JammerApp* app) {
     subghz_devices_idle(app->device);
 
     app->jamming_mode = (app->jamming_mode + 1) % 14;
+    save_config(app->frequency, (uint8_t)app->jamming_mode);
 
     switch(app->jamming_mode) {
         case JammerModeOok650Async:
