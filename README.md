@@ -1,4 +1,4 @@
-# RF Jammer App by RocketGod ☠️📡
+# RF Jammer App by AleksFolt ☠️📡
 
 This **RF Jammer App** for the Flipper Zero, made by **RocketGod**, is a powerful tool for jamming across multiple radio frequencies and modulation schemes. Below is an in-depth look at each mode, from its technical details to the real-world impact of its jamming strategy.
 
